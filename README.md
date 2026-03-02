@@ -129,13 +129,46 @@ To retrain the Samantha model, replace `models/samantha.tflite` with a new `.tfl
 
 ---
 
-## Pepper's Ghost Tips
+## Pepper's Ghost Display Build
 
-- Background must be **pure black** (transparent in reflection)
-- Orb is centered with wide black border for clean reflection geometry
-- Glass angle: **45°**
-- Screen brightness: **80–100%**
-- Lower ambient light = more convincing illusion
+The orb is designed to float inside a **glass dome** using the Pepper's Ghost illusion — a classic stage trick that makes a 2D image appear as a solid, luminous 3D object suspended in mid-air.
+
+### How it works
+
+A small **polycarbonate reflector panel** (cut to ~45°) sits inside the dome and catches the screen image reflecting it toward the viewer. Because the background is pure black, only the glowing orb is visible in the reflection — the screen itself disappears.
+
+```
+        ┌─────────────────────┐
+        │     Glass Dome      │
+        │                     │
+        │      ✦ orb ✦        │  ← reflected image appears to float here
+        │         ↗           │
+        │   ╱ reflector ╲     │  ← 45° polycarbonate panel
+        │                     │
+        └──────────┬──────────┘
+                   │
+           ┌───────┴───────┐
+           │  7" Pi Screen  │  ← face-up, displaying orb_display.py
+           └───────────────┘
+```
+
+### Components
+
+| Part | Notes |
+|------|-------|
+| **Glass dome** | Bell jar or cloche style; diameter sets how large the floating orb appears |
+| **Polycarbonate sheet** | ~2–3mm, cut to a circle that fits inside the dome at 45°; thin acrylic also works |
+| **7" Raspberry Pi display** | Placed face-up beneath the dome; HDMI or DSI connection to the Pi |
+| **Raspberry Pi Zero 2 W** | Sits alongside or beneath the display |
+
+### Tips
+
+- Background must be **pure black** — anything non-black becomes visible in the reflection
+- Orb is centered with a wide black border to give the illusion room to breathe
+- Reflector angle: **45°** is ideal; small deviations shift where the image appears to float
+- Screen brightness: **80–100%** — brighter = more vivid reflection
+- Lower ambient light = more convincing illusion; works best in a dim room
+- A matte black interior on the dome base eliminates stray reflections
 
 ---
 
