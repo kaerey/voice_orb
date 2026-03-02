@@ -1,0 +1,51 @@
+--- /home/satellite/linux-voice-assistant/linux_voice_assistant/satellite.py.bak	2026-03-01 16:11:15.893990572 -0700
++++ /home/satellite/linux-voice-assistant/linux_voice_assistant/satellite.py	2026-03-01 16:12:06.697866394 -0700
+@@ -364,41 +364,13 @@
+             )
+             _LOGGER.info("Connected to Home Assistant")
+         elif isinstance(msg, VoiceAssistantSetConfiguration):
+-            # Change active wake words
+-            active_wake_words: Set[str] = set()
+-
+-            for wake_word_id in msg.active_wake_words:
+-                if wake_word_id in self.state.wake_words:
+-                    # Already active
+-                    active_wake_words.add(wake_word_id)
+-                    continue
+-
+-                model_info = self.state.available_wake_words.get(wake_word_id)
+-                if not model_info:
+-                    # Check external wake words (may require download)
+-                    external_wake_word = self._external_wake_words.get(wake_word_id)
+-                    if not external_wake_word:
+-                        continue
+-
+-                    model_info = self._download_external_wake_word(external_wake_word)
+-                    if not model_info:
+-                        continue
+-
+-                    self.state.available_wake_words[wake_word_id] = model_info
+-
+-                _LOGGER.debug("Loading wake word: %s", model_info.wake_word_path)
+-                self.state.wake_words[wake_word_id] = model_info.load()
+-
+-                _LOGGER.info("Wake word set: %s", wake_word_id)
+-                active_wake_words.add(wake_word_id)
+-                break
+-
+-            self.state.active_wake_words = active_wake_words
+-            _LOGGER.debug("Active wake words: %s", active_wake_words)
+-
+-            self.state.preferences.active_wake_words = list(active_wake_words)
+-            self.state.save_preferences()
+-            self.state.wake_words_changed = True
++            # Local wake word mode: ignore HA's wake word configuration.
++            # Active wake words are controlled entirely by --wake-model and preferences.json.
++            _LOGGER.debug(
++                "Ignoring HA wake word config (local mode) — HA requested: %s, keeping: %s",
++                list(msg.active_wake_words),
++                list(self.state.active_wake_words),
++            )
+ 
+     def handle_audio(self, audio_chunk: bytes) -> None:
+ 

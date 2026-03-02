@@ -1,0 +1,16 @@
+[Unit]
+Description=Voice Orb Bridge (Samantha)
+Documentation=https://github.com/OHF-Voice/linux-voice-assistant
+After=network.target sound.target
+
+[Service]
+User=pi
+WorkingDirectory=/home/pi/voice-orb
+
+ExecStart=/usr/bin/python3 /home/pi/voice-orb/voice_orb_bridge.py
+
+Restart=always
+RestartSec=3
+
+[Install]
+WantedBy=multi-user.target
