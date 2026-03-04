@@ -78,8 +78,7 @@ CONFIG = {
     "ha_token": "***REDACTED***",
 
     # Entity ID of the LVA satellite in HA.
-    # Leave blank to auto-discover the first assist_satellite.* entity.
-    "ha_satellite_entity": "",
+    "ha_satellite_entity": "assist_satellite.samantha_assist_satellite",
 }
 
 # ─────────────────────────────────────────────────────────────────────────────
