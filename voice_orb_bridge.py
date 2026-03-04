@@ -25,6 +25,7 @@ import asyncio
 import json
 import logging
 import threading
+import time
 from pathlib import Path
 
 # ── Optional: audio level analysis ──────────────────────────────────────────
@@ -169,35 +170,39 @@ def audio_capture_thread():
     if not AUDIO_AVAILABLE:
         return
 
-    pa = pyaudio.PyAudio()
-    dev_idx = CONFIG["audio_device_index"]
-    if dev_idx < 0:
-        dev_idx = pa.get_default_input_device_info()["index"]
+    while True:
+        try:
+            pa = pyaudio.PyAudio()
+            dev_idx = CONFIG["audio_device_index"]
+            if dev_idx < 0:
+                dev_idx = pa.get_default_input_device_info()["index"]
 
-    info = pa.get_device_info_by_index(dev_idx)
-    log.info(f"🎙  Audio capture: [{dev_idx}] {info['name']}")
+            info = pa.get_device_info_by_index(dev_idx)
+            if info.get("maxInputChannels", 0) < 1:
+                raise RuntimeError(f"Device [{dev_idx}] {info['name']!r} has no input channels")
+            log.info(f"🎙  Audio capture: [{dev_idx}] {info['name']}")
 
-    stream = pa.open(
-        format=pyaudio.paInt16,
-        channels=CONFIG["audio_channels"],
-        rate=CONFIG["audio_rate"],
-        input=True,
-        input_device_index=dev_idx,
-        frames_per_buffer=CONFIG["audio_chunk"],
-    )
-
-    try:
-        while True:
-            data = stream.read(CONFIG["audio_chunk"], exception_on_overflow=False)
-            samples = np.frombuffer(data, dtype=np.int16).astype(np.float32) / 32768.0
-            rms = float(np.sqrt(np.mean(samples ** 2)))
-            orb.set_audio_level(min(1.0, rms * 8.0))
-    except Exception as e:
-        log.error(f"Audio thread error: {e}")
-    finally:
-        stream.stop_stream()
-        stream.close()
-        pa.terminate()
+            stream = pa.open(
+                format=pyaudio.paInt16,
+                channels=CONFIG["audio_channels"],
+                rate=CONFIG["audio_rate"],
+                input=True,
+                input_device_index=dev_idx,
+                frames_per_buffer=CONFIG["audio_chunk"],
+            )
+            try:
+                while True:
+                    data = stream.read(CONFIG["audio_chunk"], exception_on_overflow=False)
+                    samples = np.frombuffer(data, dtype=np.int16).astype(np.float32) / 32768.0
+                    rms = float(np.sqrt(np.mean(samples ** 2)))
+                    orb.set_audio_level(min(1.0, rms * 8.0))
+            finally:
+                stream.stop_stream()
+                stream.close()
+                pa.terminate()
+        except Exception as e:
+            log.warning(f"Audio capture unavailable, retrying in 20s: {e}")
+            time.sleep(20)
 
 # ─────────────────────────────────────────────────────────────────────────────
 # HOME ASSISTANT WEBSOCKET LISTENER
