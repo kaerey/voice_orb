@@ -444,6 +444,7 @@ async def run_ws_server():
         CONFIG["ws_port"],
         ping_interval=20,
         ping_timeout=10,
+        reuse_address=True,
     ):
         log.info(f"🔌 WebSocket server: ws://{CONFIG['ws_host']}:{CONFIG['ws_port']}")
         await asyncio.Future()
