@@ -1,29 +1,24 @@
 [Unit]
 Description=Linux Voice Assistant (Samantha)
-Documentation=https://github.com/OHF-Voice/linux-voice-assistant
 After=network.target sound.target voice-orb-bridge.service
 Wants=voice-orb-bridge.service
 
 [Service]
-User=pi
-WorkingDirectory=/home/pi/linux-voice-assistant
-
-ExecStart=/home/pi/linux-voice-assistant/.venv/bin/python3 \
+User=satellite
+WorkingDirectory=/home/satellite/linux-voice-assistant
+Environment=XDG_RUNTIME_DIR=/run/user/1000
+Environment=PULSE_SERVER=unix:/run/user/1000/pulse/native
+ExecStart=/home/satellite/linux-voice-assistant/.venv/bin/python3 \
   -m linux_voice_assistant \
   --name Samantha \
-  --wake-word-dir /home/pi/voice-orb/models \
+  --wake-word-dir /home/satellite/voice_orb/models \
+  --wake-word-dir /home/satellite/linux-voice-assistant/wakewords \
   --wake-model samantha \
-  --audio-input-device "YOUR_MIC_DEVICE_NAME" \
-  --audio-output-device "YOUR_SPEAKER_DEVICE_NAME"
-
-# Pipe output to the log file the bridge watches
-StandardOutput=append:/tmp/lva.log
-StandardError=append:/tmp/lva.log
-
+  --audio-input-device "Built-in Audio Stereo" \
+  --audio-output-device "pipewire/alsa_output.platform-soc_sound.stereo-fallback" \
+  --debug
 Restart=always
-RestartSec=5
-# Give audio subsystem time to start
-ExecStartPre=/bin/sleep 3
+RestartSec=8
 
 [Install]
 WantedBy=multi-user.target

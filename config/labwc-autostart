@@ -1,0 +1,19 @@
+# Kill desktop/panel -- not needed for kiosk
+pkill -f "lwrespawn.*pcmanfm" 2>/dev/null || true
+pkill -f "lwrespawn.*wf-panel" 2>/dev/null || true
+sleep 1
+pkill -f "pcmanfm --desktop" 2>/dev/null || true
+pkill wf-panel-pi 2>/dev/null || true
+
+# Disable screen blanking
+xset s off 2>/dev/null || true
+xset -dpms 2>/dev/null || true
+xset s noblank 2>/dev/null || true
+
+# Boost audio output volume (software gain)
+pactl set-sink-volume alsa_output.platform-soc_sound.stereo-fallback 150% 2>/dev/null || true
+pactl set-sink-volume alsa_output.platform-3f902000.hdmi.hdmi-stereo 150% 2>/dev/null || true
+
+# Launch pygame/GLES orb display
+sleep 3
+/usr/bin/python3 /home/satellite/voice_orb/orb_display.py >> /tmp/orb_display.log 2>&1 &
