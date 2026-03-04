@@ -2,13 +2,17 @@
 """
 voice_orb_bridge.py
 ───────────────────
-Bridges the OHF linux-voice-assistant state events to the WebSocket
-served to the Pepper's Ghost orb display (orb_display.html).
+Bridges Home Assistant voice satellite state to the WebSocket served
+to the Pepper's Ghost orb display.
 
 Architecture:
-  Mic ──► LVA (samantha wake word + HA pipeline) ──► this bridge ──► WebSocket ──► orb_display.html
-                                                            │
-                                                      pyaudio RMS ──► audio_level (particle reactivity)
+  HA WebSocket ──► this bridge ──► WebSocket :8765 ──► orb_display.html
+                                        │
+                                  pyaudio RMS ──► audio_level (particle reactivity)
+
+State source:
+  Subscribes to HA's state_changed events for the assist_satellite entity.
+  HA tracks the full pipeline lifecycle (idle → listening → processing → responding).
 
 Usage:
   python3 voice_orb_bridge.py
@@ -33,7 +37,7 @@ except ImportError:
     print("⚠  pyaudio/numpy not found — audio-reactive mode disabled.")
     print("   Install with: pip install pyaudio numpy")
 
-# ── WebSocket server ─────────────────────────────────────────────────────────
+# ── WebSocket ────────────────────────────────────────────────────────────────
 try:
     import websockets
     WS_AVAILABLE = True
@@ -63,19 +67,19 @@ CONFIG = {
     "audio_rate": 48000,
     "audio_channels": 1,
 
-    # LVA event socket — LVA publishes pipeline events here
-    "lva_event_host": "localhost",
-    "lva_event_port": 6053,
-
-    # LVA log file fallback — set to "/tmp/lva.log" if event socket isn't working
-    # Run LVA with:  python3 -m linux_voice_assistant ... 2>&1 | tee /tmp/lva.log
-    "lva_log_file": "/tmp/lva.log",
-
     # How often to push audio level to the display (seconds)
     "audio_push_interval": 0.05,
 
-    # Wake word name (used in log messages only)
-    "wake_word_name": "samantha",
+    # ── Home Assistant ──────────────────────────────────────────────────────
+    # Create a Long-Lived Access Token in HA:
+    #   Settings → Profile → scroll to bottom → Long-Lived Access Tokens → Create
+    "ha_host": "192.168.1.176",
+    "ha_port": 8123,
+    "ha_token": "***REDACTED***",
+
+    # Entity ID of the LVA satellite in HA.
+    # Leave blank to auto-discover the first assist_satellite.* entity.
+    "ha_satellite_entity": "",
 }
 
 # ─────────────────────────────────────────────────────────────────────────────
@@ -86,9 +90,9 @@ class OrbState:
     VALID_STATES = {"idle", "wake", "listening", "thinking", "speaking", "error"}
 
     def __init__(self):
-        self._state      = "idle"
+        self._state       = "idle"
         self._audio_level = 0.0
-        self._lock       = threading.Lock()
+        self._lock        = threading.Lock()
         self._listeners: list = []
 
     @property
@@ -193,153 +197,177 @@ def audio_capture_thread():
         pa.terminate()
 
 # ─────────────────────────────────────────────────────────────────────────────
-# LVA EVENT SOCKET LISTENER (primary integration)
+# HOME ASSISTANT WEBSOCKET LISTENER
 #
-# LVA emits Wyoming pipeline events over a TCP socket.
-# Connect LVA with:  --event-uri tcp://localhost:6053
+# Subscribes to state_changed events for the assist_satellite entity.
+# HA tracks the full voice pipeline lifecycle.
+#
+# HA satellite states → orb states:
+#   idle       → idle
+#   listening  → wake (brief flash) then listening
+#   processing → thinking
+#   responding → speaking
 # ─────────────────────────────────────────────────────────────────────────────
 
-LVA_EVENT_MAP = {
-    # Wyoming pipeline events
-    "run-start":            "idle",
-    "wake-word-start":      "idle",
-    "wake-word-detected":   "wake",
-    "asr-start":            "listening",
-    "asr-stop":             "thinking",
-    "asr-end":              "thinking",
-    "intent-start":         "thinking",
-    "tts-start":            "speaking",
-    "tts-end":              "idle",
-    "run-end":              "idle",
-    "error":                "error",
-    # ESPHome numeric event codes
-    "1": "idle",
-    "2": "wake",
-    "3": "listening",
-    "4": "thinking",
-    "5": "speaking",
-    "6": "idle",
-    "7": "error",
+HA_STATE_MAP = {
+    "idle":       "idle",
+    "listening":  "listening",
+    "processing": "thinking",
+    "responding": "speaking",
 }
 
+# How long (seconds) to show the "wake" flash before switching to "listening"
+WAKE_FLASH_DURATION = 0.35
 
-async def lva_event_listener():
-    host  = CONFIG["lva_event_host"]
-    port  = CONFIG["lva_event_port"]
-    delay = 5
-    max_delay = 60
-    attempt = 0
-    silent  = False
+
+async def _discover_satellite_entity(ws, msg_id: int) -> str:
+    """Query HA for all states and return the first assist_satellite entity ID."""
+    await ws.send(json.dumps({"id": msg_id, "type": "get_states"}))
+    while True:
+        raw = await ws.recv()
+        msg = json.loads(raw)
+        if msg.get("id") == msg_id:
+            break
+
+    if not (msg.get("type") == "result" and msg.get("success")):
+        log.warning("get_states failed — cannot auto-discover satellite entity")
+        return ""
+
+    for state in msg.get("result", []):
+        eid = state.get("entity_id", "")
+        if eid.startswith("assist_satellite."):
+            return eid
+
+    log.warning("No assist_satellite.* entity found in HA")
+    return ""
+
+
+async def ha_ws_listener():
+    """Connect to HA WebSocket, authenticate, and subscribe to satellite state changes."""
+    ha_url  = f"ws://{CONFIG['ha_host']}:{CONFIG['ha_port']}/api/websocket"
+    token   = CONFIG.get("ha_token", "")
+    entity_id = CONFIG.get("ha_satellite_entity", "")
+    delay   = 5
+    msg_id  = 1
+
+    if not token:
+        log.error("ha_token is not set in CONFIG — cannot connect to Home Assistant.")
+        log.error("Create a Long-Lived Access Token in HA: Settings → Profile → Long-Lived Access Tokens")
+        return
 
     while True:
         try:
-            if not silent:
-                log.info(f"Connecting to LVA event socket {host}:{port}…")
-            reader, writer = await asyncio.open_connection(host, port)
+            log.info(f"Connecting to HA WebSocket: {ha_url}")
+            async with websockets.connect(ha_url) as ws:
 
-            # Reset on successful connect
-            delay   = 5
-            attempt = 0
-            silent  = False
-            log.info(f"✓ LVA event socket connected — listening for '{CONFIG['wake_word_name']}'")
+                # ── Auth handshake ────────────────────────────────────────
+                msg = json.loads(await ws.recv())
+                if msg.get("type") != "auth_required":
+                    log.error(f"Unexpected HA WS open message: {msg}")
+                    await asyncio.sleep(delay)
+                    continue
 
-            while True:
-                line = await reader.readline()
-                if not line:
-                    log.warning("LVA event socket closed — will reconnect.")
-                    break
-                text = line.decode().strip()
-                try:
-                    msg = json.loads(text)
-                    event_type = msg.get("type", "")
-                except json.JSONDecodeError:
-                    event_type = text
+                await ws.send(json.dumps({"type": "auth", "access_token": token}))
+                msg = json.loads(await ws.recv())
 
-                mapped = LVA_EVENT_MAP.get(event_type)
-                if mapped:
+                if msg.get("type") == "auth_invalid":
+                    log.error("HA auth failed — check ha_token in CONFIG.")
+                    log.error("The token must be a valid Long-Lived Access Token.")
+                    await asyncio.sleep(60)
+                    continue
+
+                if msg.get("type") != "auth_ok":
+                    log.error(f"HA auth unexpected response: {msg}")
+                    await asyncio.sleep(delay)
+                    continue
+
+                log.info(f"✓ Authenticated with Home Assistant (v{msg.get('ha_version', '?')})")
+
+                # ── Auto-discover entity ──────────────────────────────────
+                if not entity_id:
+                    entity_id = await _discover_satellite_entity(ws, msg_id)
+                    msg_id += 1
+                    if entity_id:
+                        log.info(f"Auto-discovered satellite entity: {entity_id}")
+                    else:
+                        log.warning("Set ha_satellite_entity in CONFIG to specify one manually.")
+
+                # ── Subscribe to state_changed ────────────────────────────
+                await ws.send(json.dumps({
+                    "id": msg_id,
+                    "type": "subscribe_events",
+                    "event_type": "state_changed",
+                }))
+                sub_id = msg_id
+                msg_id += 1
+
+                msg = json.loads(await ws.recv())
+                if not (msg.get("type") == "result" and msg.get("success")):
+                    log.error(f"subscribe_events failed: {msg}")
+                    await asyncio.sleep(delay)
+                    continue
+
+                log.info(f"Subscribed to state_changed events (satellite: {entity_id or 'any assist_satellite.*'})")
+                delay = 5  # reset backoff on successful connect
+
+                # ── Event loop ────────────────────────────────────────────
+                async for raw in ws:
+                    try:
+                        event = json.loads(raw)
+                    except json.JSONDecodeError:
+                        continue
+
+                    if event.get("type") != "event":
+                        continue
+
+                    data = event.get("event", {}).get("data", {})
+                    eid  = data.get("entity_id", "")
+
+                    # Filter to our satellite entity
+                    if entity_id and eid != entity_id:
+                        continue
+                    if not entity_id and not eid.startswith("assist_satellite."):
+                        continue
+
+                    new_state = data.get("new_state", {}).get("state", "")
+                    old_state = (data.get("old_state") or {}).get("state", "")
+
+                    log.debug(f"HA state: {eid}  {old_state!r} → {new_state!r}")
+
+                    mapped = HA_STATE_MAP.get(new_state)
+                    if mapped is None:
+                        continue
+
+                    # Flash "wake" briefly when transitioning idle → listening
+                    # (wake word was just detected)
+                    if new_state == "listening" and old_state == "idle":
+                        orb.set_state("wake")
+                        await asyncio.sleep(WAKE_FLASH_DURATION)
+
                     orb.set_state(mapped)
-                else:
-                    log.debug(f"Unmapped LVA event: {event_type!r}")
-
-        except (ConnectionRefusedError, OSError):
-            attempt += 1
-            if not silent:
-                log.info(
-                    f"LVA not running yet on port {port} — retrying silently in background.\n"
-                    f"          Start LVA when ready; the bridge will auto-connect."
-                )
-                silent = True
-            elif attempt % 12 == 0:
-                log.info(f"Still waiting for LVA on port {port}… (attempt {attempt})")
-            await asyncio.sleep(delay)
-            delay = min(delay * 1.5, max_delay)
 
         except Exception as e:
-            log.error(f"LVA event listener error: {e}")
-            await asyncio.sleep(delay)
-            delay = min(delay * 1.5, max_delay)
+            log.error(f"HA WebSocket error: {e}")
 
-# ─────────────────────────────────────────────────────────────────────────────
-# FALLBACK: LOG FILE WATCHER
-#
-# If the event socket isn't available, watch LVA's stdout log.
-# Pipe LVA output:  python3 -m linux_voice_assistant ... 2>&1 | tee /tmp/lva.log
-# ─────────────────────────────────────────────────────────────────────────────
-
-LOG_KEYWORD_MAP = {
-    # LVA debug log patterns (with --debug flag enabled)
-    "wake_word_triggered":            "wake",     # INFO: wake sound playing = wake detected
-    "voice_assistant_stt_start":      "listening", # DEBUG: STT recording started
-    "voice_assistant_stt_end":        "thinking",  # DEBUG: STT finished, processing intent
-    "voice_assistant_intent_start":   "thinking",  # DEBUG: intent processing
-    "voice_assistant_tts_start":      "speaking",  # DEBUG: TTS audio starting
-    "tts response finished":          "idle",      # DEBUG: audio playback actually done
-    "voice_assistant_error":          "error",     # DEBUG: pipeline error
-    "stt-no-text-recognized":         "idle",      # DEBUG: nothing heard, back to idle
-    "disconnected from home assistant": "idle",    # LVA lost HA connection — reset state
-}
-
-
-async def lva_log_watcher():
-    path = CONFIG.get("lva_log_file")
-    if not path:
-        return
-
-    p = Path(path)
-    log.info(f"📄 Log watcher armed — watching {path} (waiting for file…)")
-
-    while not p.exists():
-        await asyncio.sleep(2)
-
-    log.info(f"📄 Log watcher active: {path}")
-
-    with open(p, "r") as f:
-        f.seek(0, 2)  # seek to end — don't replay old logs
-        while True:
-            line = f.readline()
-            if line:
-                lower = line.lower()
-                for kw, state in LOG_KEYWORD_MAP.items():
-                    if kw in lower:
-                        orb.set_state(state)
-                        break
-            else:
-                await asyncio.sleep(0.1)
+        log.info(f"Reconnecting to HA in {delay:.0f}s…")
+        await asyncio.sleep(delay)
+        delay = min(delay * 1.5, 60)
 
 # ─────────────────────────────────────────────────────────────────────────────
 # STATE WATCHDOG — force idle if stuck in an active state too long
 # ─────────────────────────────────────────────────────────────────────────────
 
 WATCHDOG_TIMEOUTS = {
-    "speaking":  45,   # TTS should never take longer than 45s
-    "thinking":  30,   # LLM should respond within 30s
-    "listening": 20,   # STT window
+    "speaking":  45,
+    "thinking":  30,
+    "listening": 20,
+    "wake":       5,
 }
 
 async def state_watchdog():
     import time
-    last_state     = orb.state
-    state_since    = time.monotonic()
+    last_state  = orb.state
+    state_since = time.monotonic()
 
     while True:
         await asyncio.sleep(5)
@@ -359,7 +387,7 @@ async def state_watchdog():
             state_since = now
 
 # ─────────────────────────────────────────────────────────────────────────────
-# WEBSOCKET SERVER
+# WEBSOCKET SERVER (to orb display)
 # ─────────────────────────────────────────────────────────────────────────────
 
 async def ws_handler(websocket):
@@ -368,14 +396,13 @@ async def ws_handler(websocket):
     addr = getattr(websocket, 'remote_address', ('?', '?'))
     log.info(f"🌐 Display connected: {addr[0]}:{addr[1]}")
 
-    # Push current state immediately on connect
     try:
+        # Push current state immediately on connect
         await websocket.send(json.dumps({
             "state":       orb.state,
             "audio_level": orb.get_audio_level(),
         }))
 
-        # Continuous audio level push task
         async def push_audio():
             while True:
                 await asyncio.sleep(CONFIG["audio_push_interval"])
@@ -388,7 +415,6 @@ async def ws_handler(websocket):
 
         audio_task = asyncio.create_task(push_audio())
 
-        # Forward state change messages
         while True:
             try:
                 msg = await asyncio.wait_for(q.get(), timeout=25)
@@ -434,12 +460,10 @@ async def run_http_server():
         class QuietHandler(SimpleHTTPRequestHandler):
             def log_message(self, *args): pass
             def end_headers(self):
-                # Allow cross-origin for local dev
                 self.send_header("Access-Control-Allow-Origin", "*")
                 super().end_headers()
 
         def serve():
-            # Allow fast restart by reusing port
             socketserver.TCPServer.allow_reuse_address = True
             with socketserver.TCPServer(("", 8080), QuietHandler) as httpd:
                 log.info("🌍 HTTP server:  http://localhost:8080/orb_display.html")
@@ -457,12 +481,11 @@ async def run_http_server():
 async def main():
     log.info("━" * 55)
     log.info("  🔮  Samantha Voice Orb Bridge")
-    log.info(f"  Wake word : {CONFIG['wake_word_name']}")
+    log.info(f"  HA        : {CONFIG['ha_host']}:{CONFIG['ha_port']}")
     log.info(f"  Display   : http://localhost:8080/orb_display.html")
     log.info(f"  WebSocket : ws://localhost:{CONFIG['ws_port']}")
     log.info("━" * 55)
 
-    # Start audio capture thread
     if AUDIO_AVAILABLE:
         t = threading.Thread(target=audio_capture_thread, daemon=True)
         t.start()
@@ -472,8 +495,7 @@ async def main():
     await asyncio.gather(
         run_ws_server(),
         run_http_server(),
-        lva_event_listener(),
-        lva_log_watcher(),
+        ha_ws_listener(),
         state_watchdog(),
     )
 
