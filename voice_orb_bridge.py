@@ -52,7 +52,8 @@ logging.basicConfig(
 log = logging.getLogger("voice_orb")
 
 # ─────────────────────────────────────────────────────────────────────────────
-# CONFIG — edit these to match your setup
+# CONFIG — defaults, overridden by bridge_config.json if present.
+# Run setup.py to generate bridge_config.json interactively.
 # ─────────────────────────────────────────────────────────────────────────────
 
 CONFIG = {
@@ -60,8 +61,8 @@ CONFIG = {
     "ws_host": "0.0.0.0",
     "ws_port": 8765,
 
-    # Audio input — -1 = system default mic
-    # Run with --list-devices to find your mic index
+    # Audio input device index (-1 = auto-detect).
+    # Run setup.py or pass --list-devices to find your mic index.
     "audio_device_index": -1,
     "audio_chunk": 512,
     "audio_rate": 48000,
@@ -71,15 +72,18 @@ CONFIG = {
     "audio_push_interval": 0.05,
 
     # ── Home Assistant ──────────────────────────────────────────────────────
-    # Create a Long-Lived Access Token in HA:
-    #   Settings → Profile → scroll to bottom → Long-Lived Access Tokens → Create
-    "ha_host": "192.168.1.176",
+    # These are set by setup.py → bridge_config.json (gitignored).
+    "ha_host": "",
     "ha_port": 8123,
-    "ha_token": "***REDACTED***",
-
-    # Entity ID of the LVA satellite in HA.
-    "ha_satellite_entity": "assist_satellite.samantha_assist_satellite",
+    "ha_token": "",
+    "ha_satellite_entity": "",
 }
+
+# Load local overrides from bridge_config.json (contains secrets, not in git)
+_config_path = Path(__file__).parent / "bridge_config.json"
+if _config_path.exists():
+    with open(_config_path, "r") as _f:
+        CONFIG.update(json.load(_f))
 
 # ─────────────────────────────────────────────────────────────────────────────
 # SHARED STATE

@@ -1,3 +1,6 @@
+# Local config — contains secrets, never commit
+bridge_config.json
+
 # Python
 __pycache__/
 *.pyc
