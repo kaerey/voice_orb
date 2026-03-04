@@ -438,16 +438,21 @@ async def run_ws_server():
         log.error("websockets library not installed. Run: pip install websockets")
         return
 
-    async with websockets.serve(
-        ws_handler,
-        CONFIG["ws_host"],
-        CONFIG["ws_port"],
-        ping_interval=20,
-        ping_timeout=10,
-        reuse_address=True,
-    ):
-        log.info(f"🔌 WebSocket server: ws://{CONFIG['ws_host']}:{CONFIG['ws_port']}")
-        await asyncio.Future()
+    port = CONFIG["ws_port"]
+    while True:
+        try:
+            async with websockets.serve(
+                ws_handler,
+                CONFIG["ws_host"],
+                port,
+                ping_interval=20,
+                ping_timeout=10,
+            ):
+                log.info(f"🔌 WebSocket server: ws://{CONFIG['ws_host']}:{port}")
+                await asyncio.Future()
+        except OSError:
+            log.warning(f"Port {port} in use — retrying in 5s…")
+            await asyncio.sleep(5)
 
 # ─────────────────────────────────────────────────────────────────────────────
 # HTTP FILE SERVER — serves orb_display.html on port 8080
