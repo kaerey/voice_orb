@@ -15,7 +15,7 @@ ExecStart=/home/satellite/linux-voice-assistant/.venv/bin/python3 \
   --wake-word-dir /home/satellite/linux-voice-assistant/wakewords \
   --wake-model samantha \
   --audio-input-device "Built-in Audio Pro" \
-  --audio-output-device "Built-in Audio Pro" \
+  --audio-output-device "pipewire/alsa_output.platform-soc_sound.pro-output-0" \
   --debug
 Restart=always
 RestartSec=8
