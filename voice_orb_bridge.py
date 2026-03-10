@@ -69,11 +69,12 @@ CONFIG = {
     "audio_rate": 48000,
     "audio_channels": 1,
 
-    # Audio output monitor device index (-1 = auto-detect PipeWire/PulseAudio monitor).
+    # Audio output monitor source name for TTS reactivity (empty = auto-detect via pactl).
     # This captures the speaker stream digitally — no acoustic path to the mic,
     # so no risk of the wake word triggering on TTS audio.
-    # Run --list-devices to see available monitor sources.
-    "audio_output_device_index": -1,
+    # Run 'pactl list sources short' on the Pi to find the right source name.
+    # Example: "alsa_output.platform-soc_sound.pro-output-0.monitor"
+    "audio_output_monitor_source": "",
 
     # How often to push audio level to the display (seconds)
     "audio_push_interval": 0.05,
@@ -172,46 +173,43 @@ def list_audio_devices():
     for i in range(pa.get_device_count()):
         info = pa.get_device_info_by_index(i)
         if info["maxInputChannels"] > 0:
-            tag = " ← monitor/loopback" if _is_monitor_device(info["name"]) else ""
-            print(f"  [{i}] {info['name']}  ({int(info['defaultSampleRate'])}Hz){tag}")
+            print(f"  [{i}] {info['name']}  ({int(info['defaultSampleRate'])}Hz)")
     print()
     pa.terminate()
 
 
-def _is_monitor_device(name: str) -> bool:
-    n = name.lower()
-    return "monitor" in n or "loopback" in n
+def _get_monitor_source_name() -> str | None:
+    """Return the PipeWire/PulseAudio monitor source name for the default output sink.
 
-
-def _find_output_monitor_device(pa) -> int | None:
-    """Auto-detect the PipeWire/PulseAudio monitor source for the default sink.
-
-    Returns the device index, or None if no monitor source is available
-    (e.g. bare ALSA without snd-aloop).
+    PyAudio on PipeWire only enumerates 'pulse' and 'default' virtual devices,
+    not individual sources by name.  We use pactl to find the real source name
+    so we can pass it directly to parec.
     """
-    default_sink_keyword = None
+    import subprocess
     try:
-        import subprocess
-        result = subprocess.run(
+        sink = subprocess.run(
             ["pactl", "get-default-sink"],
             capture_output=True, text=True, timeout=2
-        )
-        if result.returncode == 0:
-            default_sink_keyword = result.stdout.strip().lower()
+        ).stdout.strip()
+        if sink:
+            return sink + ".monitor"
     except Exception:
         pass
 
-    first_monitor = None
-    for i in range(pa.get_device_count()):
-        info = pa.get_device_info_by_index(i)
-        if info["maxInputChannels"] < 1 or not _is_monitor_device(info["name"]):
-            continue
-        if first_monitor is None:
-            first_monitor = i
-        if default_sink_keyword and default_sink_keyword in info["name"].lower():
-            return i  # best match — monitor for the default sink
+    # Fallback: scan pactl sources for anything with '.monitor' in the name
+    try:
+        out = subprocess.run(
+            ["pactl", "list", "sources", "short"],
+            capture_output=True, text=True, timeout=2
+        ).stdout
+        for line in out.splitlines():
+            parts = line.split()
+            if len(parts) >= 2 and ".monitor" in parts[1]:
+                return parts[1]
+    except Exception:
+        pass
 
-    return first_monitor  # fallback to first monitor found (may be None)
+    return None
 
 
 def _rms(data: bytes) -> float:
@@ -273,41 +271,59 @@ def mic_capture_thread():
 
 
 def output_capture_thread():
-    if not AUDIO_AVAILABLE:
+    """Capture TTS audio level from the PipeWire/PulseAudio monitor source.
+
+    Uses parec (PulseAudio recorder) rather than PyAudio because PyAudio on
+    PipeWire only enumerates virtual devices ('pulse', 'default') and cannot
+    address individual sources by name.  parec is always available alongside
+    PipeWire/PulseAudio and can target the monitor source directly.
+    """
+    import subprocess
+
+    # Allow override via config; otherwise auto-detect
+    monitor_source = CONFIG.get("audio_output_monitor_source") or _get_monitor_source_name()
+
+    if not monitor_source:
+        log.warning(
+            "⚠  No audio output monitor source found — orb will not react to "
+            "TTS audio during speaking.\n"
+            "   Check 'pactl list sources short' and set audio_output_monitor_source "
+            "in bridge_config.json if needed."
+        )
         return
+
+    log.info(f"🔊  Output monitor: {monitor_source}")
+
+    chunk_bytes = CONFIG["audio_chunk"] * 2  # 16-bit = 2 bytes per sample
 
     while True:
         try:
-            pa = pyaudio.PyAudio()
-            dev_idx = CONFIG["audio_output_device_index"]
-            if dev_idx < 0:
-                dev_idx = _find_output_monitor_device(pa)
-
-            if dev_idx is None:
-                pa.terminate()
-                log.warning(
-                    "⚠  No audio output monitor source found — orb will not react to "
-                    "TTS audio during speaking.\n"
-                    "   On PipeWire/PulseAudio: check 'pactl list sources short' for a "
-                    "'Monitor of ...' source.\n"
-                    "   On bare ALSA: load the snd-aloop module and set "
-                    "audio_output_device_index to its index."
-                )
-                return  # no point retrying — device list won't change without intervention
-
-            stream = _open_capture_stream(pa, dev_idx, "🔊  Output monitor")
+            proc = subprocess.Popen(
+                [
+                    "parec",
+                    f"--device={monitor_source}",
+                    "--format=s16le",
+                    "--rate=16000",
+                    "--channels=1",
+                    "--latency-msec=50",
+                ],
+                stdout=subprocess.PIPE,
+                stderr=subprocess.DEVNULL,
+            )
+            log.info(f"🔊  Output monitor stream open (parec pid={proc.pid})")
             try:
                 while True:
-                    data = stream.read(CONFIG["audio_chunk"], exception_on_overflow=False)
-                    # Output audio is typically louder; use a lower gain than the mic.
+                    data = proc.stdout.read(chunk_bytes)
+                    if not data:
+                        break
+                    # Output audio is typically louder; lower gain than mic.
                     orb.set_output_level(min(1.0, _rms(data) * 4.0))
             finally:
-                stream.stop_stream()
-                stream.close()
-                pa.terminate()
+                proc.terminate()
+                proc.wait()
         except Exception as e:
             log.warning(f"Output monitor unavailable, retrying in 20s: {e}")
-            time.sleep(20)
+        time.sleep(20)
 
 # ─────────────────────────────────────────────────────────────────────────────
 # HOME ASSISTANT WEBSOCKET LISTENER
