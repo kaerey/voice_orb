@@ -69,6 +69,12 @@ CONFIG = {
     "audio_rate": 48000,
     "audio_channels": 1,
 
+    # Audio output monitor device index (-1 = auto-detect PipeWire/PulseAudio monitor).
+    # This captures the speaker stream digitally — no acoustic path to the mic,
+    # so no risk of the wake word triggering on TTS audio.
+    # Run --list-devices to see available monitor sources.
+    "audio_output_device_index": -1,
+
     # How often to push audio level to the display (seconds)
     "audio_push_interval": 0.05,
 
@@ -94,9 +100,10 @@ class OrbState:
     VALID_STATES = {"idle", "wake", "listening", "thinking", "speaking", "error"}
 
     def __init__(self):
-        self._state       = "idle"
-        self._audio_level = 0.0
-        self._lock        = threading.Lock()
+        self._state        = "idle"
+        self._mic_level    = 0.0
+        self._output_level = 0.0
+        self._lock         = threading.Lock()
         self._listeners: list = []
 
     @property
@@ -118,11 +125,18 @@ class OrbState:
         log.info(f"{icon}  State → {new_state}")
         self._broadcast({"state": new_state})
 
-    def set_audio_level(self, level: float):
-        self._audio_level = max(0.0, min(1.0, level))
+    def set_mic_level(self, level: float):
+        self._mic_level = max(0.0, min(1.0, level))
 
-    def get_audio_level(self):
-        return self._audio_level
+    def set_output_level(self, level: float):
+        self._output_level = max(0.0, min(1.0, level))
+
+    def get_audio_level(self) -> float:
+        """Return the relevant audio level for the current state.
+        Speaking → output monitor (TTS playback). Everything else → mic."""
+        if self._state == "speaking":
+            return self._output_level
+        return self._mic_level
 
     def add_listener(self, q: asyncio.Queue):
         self._listeners.append(q)
@@ -154,19 +168,87 @@ def list_audio_devices():
         return
     pa = pyaudio.PyAudio()
     print("\nAvailable audio input devices:")
-    print("─" * 50)
+    print("─" * 55)
     for i in range(pa.get_device_count()):
         info = pa.get_device_info_by_index(i)
         if info["maxInputChannels"] > 0:
-            print(f"  [{i}] {info['name']}  ({int(info['defaultSampleRate'])}Hz)")
+            tag = " ← monitor/loopback" if _is_monitor_device(info["name"]) else ""
+            print(f"  [{i}] {info['name']}  ({int(info['defaultSampleRate'])}Hz){tag}")
     print()
     pa.terminate()
 
+
+def _is_monitor_device(name: str) -> bool:
+    n = name.lower()
+    return "monitor" in n or "loopback" in n
+
+
+def _find_output_monitor_device(pa) -> int | None:
+    """Auto-detect the PipeWire/PulseAudio monitor source for the default sink.
+
+    Returns the device index, or None if no monitor source is available
+    (e.g. bare ALSA without snd-aloop).
+    """
+    default_sink_keyword = None
+    try:
+        import subprocess
+        result = subprocess.run(
+            ["pactl", "get-default-sink"],
+            capture_output=True, text=True, timeout=2
+        )
+        if result.returncode == 0:
+            default_sink_keyword = result.stdout.strip().lower()
+    except Exception:
+        pass
+
+    first_monitor = None
+    for i in range(pa.get_device_count()):
+        info = pa.get_device_info_by_index(i)
+        if info["maxInputChannels"] < 1 or not _is_monitor_device(info["name"]):
+            continue
+        if first_monitor is None:
+            first_monitor = i
+        if default_sink_keyword and default_sink_keyword in info["name"].lower():
+            return i  # best match — monitor for the default sink
+
+    return first_monitor  # fallback to first monitor found (may be None)
+
+
+def _rms(data: bytes) -> float:
+    samples = np.frombuffer(data, dtype=np.int16).astype(np.float32) / 32768.0
+    return float(np.sqrt(np.mean(samples ** 2)))
+
+
+def _open_capture_stream(pa, dev_idx: int, label: str):
+    info = pa.get_device_info_by_index(dev_idx)
+    if info.get("maxInputChannels", 0) < 1:
+        raise RuntimeError(f"Device [{dev_idx}] {info['name']!r} has no input channels")
+    channels = min(CONFIG["audio_channels"], int(info["maxInputChannels"]))
+    log.info(f"{label}: [{dev_idx}] {info['name']}")
+    return pa.open(
+        format=pyaudio.paInt16,
+        channels=channels,
+        rate=CONFIG["audio_rate"],
+        input=True,
+        input_device_index=dev_idx,
+        frames_per_buffer=CONFIG["audio_chunk"],
+    )
+
 # ─────────────────────────────────────────────────────────────────────────────
-# AUDIO CAPTURE THREAD
+# AUDIO CAPTURE THREADS
+#
+# Two threads run independently:
+#   mic_capture_thread    — microphone RMS → orb._mic_level
+#                           Used during idle / wake / listening / thinking.
+#   output_capture_thread — PipeWire/PulseAudio monitor source RMS → orb._output_level
+#                           Used during speaking so the orb pulses to TTS audio.
+#
+# The monitor source is a purely digital tap of the speaker stream captured
+# before it reaches any physical transducer, so there is no acoustic path
+# back to the microphone and no risk of the wake word triggering on TTS.
 # ─────────────────────────────────────────────────────────────────────────────
 
-def audio_capture_thread():
+def mic_capture_thread():
     if not AUDIO_AVAILABLE:
         return
 
@@ -176,32 +258,55 @@ def audio_capture_thread():
             dev_idx = CONFIG["audio_device_index"]
             if dev_idx < 0:
                 dev_idx = pa.get_default_input_device_info()["index"]
-
-            info = pa.get_device_info_by_index(dev_idx)
-            if info.get("maxInputChannels", 0) < 1:
-                raise RuntimeError(f"Device [{dev_idx}] {info['name']!r} has no input channels")
-            log.info(f"🎙  Audio capture: [{dev_idx}] {info['name']}")
-
-            stream = pa.open(
-                format=pyaudio.paInt16,
-                channels=CONFIG["audio_channels"],
-                rate=CONFIG["audio_rate"],
-                input=True,
-                input_device_index=dev_idx,
-                frames_per_buffer=CONFIG["audio_chunk"],
-            )
+            stream = _open_capture_stream(pa, dev_idx, "🎙  Mic capture")
             try:
                 while True:
                     data = stream.read(CONFIG["audio_chunk"], exception_on_overflow=False)
-                    samples = np.frombuffer(data, dtype=np.int16).astype(np.float32) / 32768.0
-                    rms = float(np.sqrt(np.mean(samples ** 2)))
-                    orb.set_audio_level(min(1.0, rms * 8.0))
+                    orb.set_mic_level(min(1.0, _rms(data) * 8.0))
             finally:
                 stream.stop_stream()
                 stream.close()
                 pa.terminate()
         except Exception as e:
-            log.warning(f"Audio capture unavailable, retrying in 20s: {e}")
+            log.warning(f"Mic capture unavailable, retrying in 20s: {e}")
+            time.sleep(20)
+
+
+def output_capture_thread():
+    if not AUDIO_AVAILABLE:
+        return
+
+    while True:
+        try:
+            pa = pyaudio.PyAudio()
+            dev_idx = CONFIG["audio_output_device_index"]
+            if dev_idx < 0:
+                dev_idx = _find_output_monitor_device(pa)
+
+            if dev_idx is None:
+                pa.terminate()
+                log.warning(
+                    "⚠  No audio output monitor source found — orb will not react to "
+                    "TTS audio during speaking.\n"
+                    "   On PipeWire/PulseAudio: check 'pactl list sources short' for a "
+                    "'Monitor of ...' source.\n"
+                    "   On bare ALSA: load the snd-aloop module and set "
+                    "audio_output_device_index to its index."
+                )
+                return  # no point retrying — device list won't change without intervention
+
+            stream = _open_capture_stream(pa, dev_idx, "🔊  Output monitor")
+            try:
+                while True:
+                    data = stream.read(CONFIG["audio_chunk"], exception_on_overflow=False)
+                    # Output audio is typically louder; use a lower gain than the mic.
+                    orb.set_output_level(min(1.0, _rms(data) * 4.0))
+            finally:
+                stream.stop_stream()
+                stream.close()
+                pa.terminate()
+        except Exception as e:
+            log.warning(f"Output monitor unavailable, retrying in 20s: {e}")
             time.sleep(20)
 
 # ─────────────────────────────────────────────────────────────────────────────
@@ -404,6 +509,7 @@ async def ws_handler(websocket):
     addr = getattr(websocket, 'remote_address', ('?', '?'))
     log.info(f"🌐 Display connected: {addr[0]}:{addr[1]}")
 
+    audio_task = None
     try:
         # Push current state immediately on connect
         await websocket.send(json.dumps({
@@ -433,7 +539,8 @@ async def ws_handler(websocket):
     except Exception:
         pass
     finally:
-        audio_task.cancel()
+        if audio_task is not None:
+            audio_task.cancel()
         orb.remove_listener(q)
         log.info(f"🌐 Display disconnected: {addr[0]}:{addr[1]}")
 
@@ -501,8 +608,8 @@ async def main():
     log.info("━" * 55)
 
     if AUDIO_AVAILABLE:
-        t = threading.Thread(target=audio_capture_thread, daemon=True)
-        t.start()
+        threading.Thread(target=mic_capture_thread, daemon=True, name="mic-capture").start()
+        threading.Thread(target=output_capture_thread, daemon=True, name="output-capture").start()
     else:
         log.warning("Audio capture disabled — orb will not react to sound.")
 
